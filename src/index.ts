@@ -11,6 +11,7 @@ import {
 import { broadcast, waitUntilUTXO } from "./blockstream_utils";
 import { ECPairFactory, ECPairAPI, TinySecp256k1Interface } from 'ecpair';
 import { Taptree } from "bitcoinjs-lib/src/types";
+import { witnessStackToScriptWitness } from "./witness_stack_to_script_witness";
 
 const tinysecp: TinySecp256k1Interface = require('tiny-secp256k1');
 initEccLib(tinysecp as any);
@@ -19,12 +20,9 @@ const ECPair: ECPairAPI = ECPairFactory(tinysecp);
 console.log(`Running "Pay to Pubkey with taproot example"`);
 
 const network = networks.testnet;
-const keypair = ECPair.fromPrivateKey(
-    Buffer.from("0cb1c95b2814d998fe83ccf3485ac59e9d30222469b8d7969325b42ad99fae78", "hex"),
-    { network }
-);
+const keypair = ECPair.makeRandom({ network });
 
-// Tweak the original keypai
+// Tweak the original keypair
 const tweakedSigner = tweakSigner(keypair, { network });
 // Generate an address from the tweaked public key
 const p2pktr = payments.p2tr({
@@ -48,7 +46,7 @@ waitUntilUTXO(p2pktr_addr)
 
         psbt.addOutput({
             address: "mohjSavDdQYHRYXcS3uS6ttaHP8amyvX78", // faucet address
-            value: data[0].value - 50
+            value: data[0].value - 150
         });
 
         psbt.signInput(0, tweakedSigner);
@@ -68,30 +66,36 @@ console.log(`Running "Taptree example"`);
 // One path should allow spending using secret
 // The other path should pay to another pubkey
 
-// Let's create a p2pkh address from our original keypair for testing
-const p2pkh = payments.p2pkh({
-    pubkey: keypair.publicKey,
-    network
-});
+// Make random key for hash_lock
+const hash_lock_keypair = ECPair.makeRandom({ network });
+
 
 const secret_bytes = Buffer.from('SECRET');
 const hash = crypto.hash160(secret_bytes);
-const hash_lock_script = script.compile([
-    opcodes.OP_HASH160,
-    hash,
-    opcodes.OP_EQUALVERIFY,
-    Buffer.from(p2pkh.address ?? ''),
-    opcodes.OP_CHECKSIG
-]);
+// Construct script to pay to hash_lock_keypair if the correct preimage/secret is provided
+const hash_script_asm = `OP_HASH160 ${hash.toString('hex')} OP_EQUALVERIFY ${toXOnly(hash_lock_keypair.publicKey).toString('hex')} OP_CHECKSIG`;
+const hash_lock_script = script.fromASM(hash_script_asm);
+
+const p2pk_script_asm = `${toXOnly(keypair.publicKey).toString('hex')} OP_CHECKSIG`;
+const p2pk_script = script.fromASM(p2pk_script_asm);
 
 const scriptTree: Taptree = [
     {
         output: hash_lock_script
     },
     {
-        output: p2pkh.output!
+        output: p2pk_script
     }
 ];
+
+const hash_lock_redeem = {
+    output: hash_lock_script,
+    redeemVersion: 192,
+};
+const p2pk_redeem = {
+    output: p2pk_script,
+    redeemVersion: 192
+}
 
 const script_p2tr = payments.p2tr({
     internalPubkey: toXOnly(keypair.publicKey),
@@ -100,30 +104,42 @@ const script_p2tr = payments.p2tr({
 });
 const script_addr = script_p2tr.address ?? '';
 
-console.log(script_p2tr.witness);
+const p2pk_p2tr = payments.p2tr({
+    internalPubkey: toXOnly(keypair.publicKey),
+    scriptTree,
+    redeem: p2pk_redeem,
+    network
+});
+
+const hash_lock_p2tr = payments.p2tr({
+    internalPubkey: toXOnly(keypair.publicKey),
+    scriptTree,
+    redeem: hash_lock_redeem,
+    network
+});
 
 console.log(`Waiting till UTXO is detected at this Address: ${script_addr}`);
 waitUntilUTXO(script_addr)
     .then(async (data) => {
-        console.log(`Trying the hash lock path with UTXO ${data[0].txid}:${data[0].vout}`);
+        console.log(`Trying the P2PK path with UTXO ${data[0].txid}:${data[0].vout}`);
 
         const psbt = new Psbt({ network });
         psbt.addInput({
             hash: data[0].txid,
             index: data[0].vout,
-            witnessUtxo: { value: data[0].value, script: script_p2tr.output! },
+            witnessUtxo: { value: data[0].value, script: p2pk_p2tr.output! },
             tapLeafScript: [
                 {
-                    leafVersion: 192,
-                    script: hash_lock_script,
-                    controlBlock: script_p2tr.witness![0]
+                    leafVersion: p2pk_redeem.redeemVersion,
+                    script: p2pk_redeem.output,
+                    controlBlock: p2pk_p2tr.witness![p2pk_p2tr.witness!.length - 1]
                 }
             ]
         });
 
         psbt.addOutput({
             address: "mohjSavDdQYHRYXcS3uS6ttaHP8amyvX78", // faucet address
-            value: data[0].value - 50
+            value: data[0].value - 150
         });
 
         psbt.signInput(0, keypair);
@@ -134,6 +150,59 @@ waitUntilUTXO(script_addr)
         const txid = await broadcast(tx.toHex());
         console.log(`Success! Txid is ${txid}`);
     });
+
+console.log(`Waiting till UTXO is detected at this Address: ${script_addr}`);
+waitUntilUTXO(script_addr)
+    .then(async (data) => {
+        console.log(`Trying the Hash lock spend path with UTXO ${data[0].txid}:${data[0].vout}`);
+
+        const tapLeafScript = {
+            leafVersion: hash_lock_redeem.redeemVersion,
+            script: hash_lock_redeem.output,
+            controlBlock: hash_lock_p2tr.witness![hash_lock_p2tr.witness!.length - 1]
+        };
+
+        const psbt = new Psbt({ network });
+        psbt.addInput({
+            hash: data[0].txid,
+            index: data[0].vout,
+            witnessUtxo: { value: data[0].value, script: hash_lock_p2tr.output! },
+            tapLeafScript: [
+                tapLeafScript
+            ]
+        });
+
+        psbt.addOutput({
+            address: "mohjSavDdQYHRYXcS3uS6ttaHP8amyvX78", // faucet address
+            value: data[0].value - 150
+        });
+
+        psbt.signInput(0, hash_lock_keypair);
+
+        // We have to construct our witness script in a custom finalizer
+       
+        const customFinalizer = (_inputIndex: number, input: any) => {
+            const scriptSolution = [
+                input.tapScriptSig[0].signature,
+                secret_bytes
+            ];
+            const witness = scriptSolution
+                .concat(tapLeafScript.script)
+                .concat(tapLeafScript.controlBlock);
+
+            return {
+                finalScriptWitness: witnessStackToScriptWitness(witness)
+            }
+        }
+
+        psbt.finalizeInput(0, customFinalizer);
+
+        const tx = psbt.extractTransaction();
+        console.log(`Broadcasting Transaction Hex: ${tx.toHex()}`);
+        const txid = await broadcast(tx.toHex());
+        console.log(`Success! Txid is ${txid}`);
+    });
+
 
 function tweakSigner(signer: Signer, opts: any = {}): Signer {
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
