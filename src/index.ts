@@ -201,6 +201,34 @@ async function start_taptree(keypair: Signer) {
     console.log(`Broadcasting Transaction Hex: ${tx.toHex()}`);
     txid = await broadcast(tx.toHex());
     console.log(`Success! Txid is ${txid}`);
+
+    // We can also spend from this address without using the script tree
+
+    console.log(`Waiting till UTXO is detected at this Address: ${script_addr}`);
+    utxos = await waitUntilUTXO(script_addr)
+    console.log(`Trying the Hash lock spend path with UTXO ${utxos[0].txid}:${utxos[0].vout}`);
+
+    const key_spend_psbt = new Psbt({ network });
+    key_spend_psbt.addInput({
+        hash: utxos[0].txid,
+        index: utxos[0].vout,
+        witnessUtxo: { value: utxos[0].value, script: script_p2tr.output! },
+        tapInternalKey: toXOnly(keypair.publicKey),
+        tapMerkleRoot: script_p2tr.hash
+    });
+    key_spend_psbt.addOutput({
+        address: "mohjSavDdQYHRYXcS3uS6ttaHP8amyvX78", // faucet address
+        value: utxos[0].value - 150
+    });
+    // We need to create a signer tweaked by script tree's merkle root
+    const tweakedSigner = tweakSigner(keypair, { tweakHash: script_p2tr.hash });
+    key_spend_psbt.signInput(0, tweakedSigner);
+    key_spend_psbt.finalizeAllInputs();
+
+    tx = key_spend_psbt.extractTransaction();
+    console.log(`Broadcasting Transaction Hex: ${tx.toHex()}`);
+    txid = await broadcast(tx.toHex());
+    console.log(`Success! Txid is ${txid}`);
 }
 
 start().then(() => process.exit());
